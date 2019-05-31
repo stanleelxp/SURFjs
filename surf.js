@@ -1,4 +1,5 @@
 import Jimp from 'jimp';
+import { solve } from 'ml-matrix'; // ~6.0.0
 
 const ORI_RADIUS = 6;
 const ORI_WIN = 60;
@@ -13,31 +14,25 @@ class SURF {
     constructor() {
         this.sum = [];
         this.maskSum = [];
+        this.mask = [];
         this.sizes = [];
         this.dets = [];
         this.traces = [];
         this.descriptors = [];
         this.middleIndices = [];
         this.keypoints = [];
-        /*
-        this.keypoint = {
-            x: 0,
-            y: 0
-            size: 0,
-            angle: 0,
-            octave: 0,
-            response: 0,
-            classID: -1 
-        };
-        */
-        this.range = [0, 0];
         this.octaves = 4;
-        this.octaveLayers = 3;
+        this.octaveLayers = 2;
         this.sampleStep = 2;
         this.hessianThreshold = 100;
         this.useProvidedKeypoints = false;
-        this.upright = false;
+        // upright = true is much faster (not compute orientation)
+        this.upright = true;
         this.extended = false;
+        this.doDescriptors = true;
+        this.filePath = './c1.jpg';
+        this.height = 0;
+        this.width = 0;
     }
 
     genZeros(height, width) {
@@ -62,6 +57,7 @@ class SURF {
         }
     }
 
+    // not in use
     genMatrices(N, height, width) {
         if (N === undefined || height === undefined || width === undefined || N < 1 || height < 1 || width < 1) {
             return [];
@@ -80,6 +76,54 @@ class SURF {
             }
             return arr3D;
         }
+    }
+
+    createGaussianKernel(n, SIGMA) {
+        let sum = 0;
+        let kernel = [];
+        const scale = -0.5 / (sigma * sigma);
+        const sigma = Math.max(SIGMA, 0);
+        const n2 = Math.floor(n / 2);
+        for (let i = 0; i < n; i++) {
+            const values = [];
+            for (let j = 0; j < n; j++) {
+                let d2 = (i - n2) * (i - n2) + (j - n2) * (j - n2);
+                values.push(Math.exp(d2 * scale));
+                sum += values[j];
+            }
+            kernel.push(values);
+        }
+        for (let i = 0; i < n; i++) {
+            for (let j = 0; j < n; j++) {
+                kernel[i][j] /= sum;
+            }
+        }
+        return kernel;
+    }
+
+    integral(img) {
+        const height = img.bitmap.height;
+        const width = img.bitmap.width;
+        const data = img.bitmap.data;
+        const sum = this.genZeros(height, width);
+        // TODO
+        for (let i = 0; i < height; i++) {
+            for (let j = 0; j < width; i++) {
+                if (i === 0) {
+                    const idx = j * 4;
+                    sum[0][j] += data[idx];
+                    continue;
+                } else if (j === 0) {
+                    const idx = i * width * 4;
+                    sum[i][0] += data[idx];
+                } else {
+                    const idx = i * width * 4 + j * 4;
+                    sum[i][j] = sum[i - 1][j] + sum[i][j - 1] - sum[i - 1][j - 1] + data[idx];
+                }
+            }
+        }
+
+        return sum;
     }
 
     calcHaarPattern(src, hf, N, hOffset, wOffset) {
@@ -116,8 +160,10 @@ class SURF {
         }
     }
 
-    calcLayerDetAndTrace(sum, size, sampleStep, det, trace) {
-        if (size > sum.length - 1 || size > sum[0].length - 1) {
+    calcLayerDetAndTrace(size, sampleStep, det, trace) {
+        const height = this.height;
+        const width = this.width;
+        if (size > height - 1 || size > width - 1) {
             return;
         }
 
@@ -127,8 +173,6 @@ class SURF {
         const dx_s = [[0, 2, 3, 7, 1], [3, 2, 6, 7, -2], [6, 2, 9, 7, 1]];
         const dy_s = [[2, 0, 7, 3, 1], [2, 3, 7, 6, -2], [2, 6, 7, 9, 1]];
         const dxy_s = [[1, 1, 4, 4, 1], [5, 1, 8, 4, -1], [1, 5, 4, 8, -1], [5, 5, 8, 8, 1]];
-        const height = sum.length;
-        const width = sum[0].length;
 
         const Dx = this.genZeros(NX, 5); 
         const Dy = this.genZeros(NY, 5); 
@@ -149,9 +193,9 @@ class SURF {
                 wOffset: sumIdx % width
             };
             for (let j = 0; j < widthRange; j++) {
-                const dx = this.calcHaarPattern(sum, Dx, 3, sumOffset);
-                const dy = this.calcHaarPattern(sum, Dy, 3, sumOffset);
-                const dxy = this.calcHaarPattern(sum, Dxy, 4, sumOffset);
+                const dx = this.calcHaarPattern(this.sum, Dx, 3, sumOffset);
+                const dy = this.calcHaarPattern(this.sum, Dy, 3, sumOffset);
+                const dxy = this.calcHaarPattern(this.sum, Dxy, 4, sumOffset);
                 sumIdx += sampleStep;
                 sumOffset = {
                     hOffset: Math.floor(sumIdx / width),
@@ -176,21 +220,22 @@ class SURF {
             N9[0][4] - 2 * N9[1][4] + N9[1][4]];
 
         // TODO
-        const x = A.solve(b, decomp_lu);
+        // const x = A.solve(b, decomp_lu);
+        const x = solve(A, b, (useSVD = true));
         const isOK = (x[0] !== 0 || x[1] !== 0 || x2 !== 0) &&
             Math.abs(x[0]) <= 1 && Math.abs(x[1]) <= 1 && Math.abs(x[2]) <= 1;
 
         if (isOK) {
-            kpt.pt.x += x[0] * dx;
-            kpt.pt.y += x[1] * dy;
-            kpt.size = Math.round(kpt.length + x[2] * ds);
+            kpt.x += x[0] * dx;
+            kpt.y += x[1] * dy;
+            kpt.size = Math.round(kpt.size + x[2] * ds);
         }
         return isOK;
     }
 
     buildInvoker(totalLayers) {
         for (let i = 0; i < totalLayers; i++) {
-            this.calcLayerDetAndTrace();
+            this.calcLayerDetAndTrace(this.sizes[i], this.sampleSteps[i], this.dets[i], this.traces[i]);
         }
 
     }
@@ -215,8 +260,8 @@ class SURF {
         const maskSum = this.maskSum;
         const size = this.sizes[layer];
         const sampleStep = this.sampleSteps[layer];
-        const height = this.sum.length;
-        const width = this.sum[0].length;
+        const height = this.height;
+        const width = this.width;
         const layerHeight = height / sampleStep;
         const layerWidth = width / sampleStep;
         const hessianThreshold = this.hessianThreshold;
@@ -253,6 +298,7 @@ class SURF {
                             dets[layer + 1][-1], dets[layer + 1][0], dets[layer + 1][1],
                             dets[layer + 1][step - 1], dets[layer + 1][step], dets[layer + 1][step + 1]]];
                     */
+                    // TODO -step
                     const N9 = [[d1[-step - 1], d1[-step], d1[-step + 1],
                         d1[-1], d1[0], d1[1],
                         d1[step - 1], d1[step], d1[step + 1]],
@@ -275,7 +321,7 @@ class SURF {
                     }
 
                     // TODO N9 max
-                    if(val > Math.max(N9)) {
+                    if(val > Math.max.apply(null, N9)) {
                         const hCenter = hOffset + (size - 1) * 0.5;
                         const wCenter = wOffset + (size - 1) * 0.5;
 
@@ -310,8 +356,8 @@ class SURF {
         const middleLayers = octaveLayers * octaves;
         const octaves = this.octaves;
         const octaveLayers = this.octaveLayers;
-        const height = this.sum.length;
-        const width = this.sum[0].length;
+        const height = this.height;
+        const width = this.width;
         // this.dets = this.genMatrices(totalLayers, height, width);
         // this.traces = this.genMatrices(totalLayers, height, width);
 
@@ -351,46 +397,47 @@ class SURF {
         keypoints.sort((a, b) => b.response - a.response);
     }
     
-    createGaussianKernel(n, SIGMA) {
-        let sum = 0;
-        let kernel = [];
-        const scale = -0.5 / (sigma * sigma);
-        const sigma = Math.max(SIGMA, 0);
-        const n2 = Math.floor(n / 2);
-        for (let i = 0; i < n; i++) {
-            const values = [];
-            for (let j = 0; j < n; j++) {
-                let d2 = (i - n2) * (i - n2) + (j - n2) * (j - n2);
-                values.push(Math.exp(d2 * scale));
-                sum += values[j];
-            }
-            kernel.push(values);
-        }
-        for (let i = 0; i < n; i++) {
-            for (let j = 0; j < n; j++) {
-                kernel[i][j] /= sum;
-            }
-        }
-        return kernel;
-    }
-
-    // TODO
-    invoker() {
+    invoke(img, kps) {
+        const NX = 2;
+        const NY = 2;
+        const dx_s =[[0, 0, 2, 4, -1], [2, 0, 4, 4, 1]];
+        const dy_s =[[0, 0, 4, 2, 1], [0, 2, 4, 4, -1]];
         const oriSampleBound = (2 * ORI_RADIUS + 1) * (2 * ORI_RADIUS + 1);
-        // TODO
+        const X = this.genZeros(oriSampleBound);
+        const Y = this.genZeros(oriSampleBound);
+        const angle = this.genZeros(oriSampleBound);
+        const DX = this.genZeros(PATCH_SZ, PATCH_SZ);
+        const DY = this.genZeros(PATCH_SZ, PATCH_SZ);
+        const patch = this.genZeros(PATCH_SZ + 1, PATCH_SZ + 1);
+        const _patch = this.genZeros(PATCH_SZ + 1, PATCH_SZ + 1);
         const apt = this.genZeros(oriSampleBound);
         const aptw = this.genZeros(oriSampleBound);
         const DW = this.genZeros(PATCH_SZ * PATCH_SZ);
-        const gOri = createGaussianKernel(2 * ORI_RADIUS + 1, SURF_ORI_SIGMA);
-        const gDesc = createGaussianKernel(PATCH_SZ, SURF_DESC_SIGMA);
-        this.OriSamples = 0;
+        const gOri = this.createGaussianKernel(2 * ORI_RADIUS + 1, SURF_ORI_SIGMA);
+        const gDesc = this.createGaussianKernel(PATCH_SZ, SURF_DESC_SIGMA);
+        const dSize = this.extended ? 128: 64;
+        const height = this.height;
+        const width = this.width;
+        let oriSamples = 0;
+        /*
+        let maxSize = 0;
+        let iMaxSize = 0;
+        for (let k = 0; k < kps; k++) {
+            maxSize = Math.max(maxSize, this.keypoints[k].size);
+        }
+        iMaxSize = Math.max(1, Math.ceil((PATCH_SZ + 1) * maxSize * 1.2 / 9.0));
+        const winBuf = this.genZeros(imaxSize, imaxSize);
+        */
+
         for (let i = -ORI_RADIUS; i <= ORI_RADIUS; i++) {
             for (let j = -ORI_RADIUS; j <= ORI_RADIUS; j++) {
                 if (i * i + j * j <= ORI_RADIUS * ORI_RADIUS) {
                     const weight_ = gOri[i + ORI_RADIUS][0] * gOri[j + ORI_RADIUS][0];
-                    apt.push([i, j]);
-                    aptw.push(weight_);
-                    this.OriSamples += 1;
+                    // TODO apt
+                    // apt.push([i, j]);
+                    apt[oriSamples] = [i, j];
+                    aptw[oriSamples] = weight_;
+                    oriSamples += 1;
                 }
             }
         }
@@ -399,51 +446,33 @@ class SURF {
                 DW[i * PATCH_SZ + j] = gDesc[i][0] * gDesc[j][0];
             }
         }
-    }
 
-    invoke(N) {
-        const NX = 2;
-        const NY = 2;
-        const dx_s =[[0, 0, 2, 4, -1], [2, 0, 4, 4, 1]];
-        const dy_s =[[0, 0, 4, 2, 1], [0, 2, 4, 4, -1]];
-        const oriSampleBound = (2 * ORI_RADIUS + 1) * (2 * ORI_RADIUS + 1);
-        const X = [];
-        const Y = [];
-        const angle = [];
-        const patch = this.genZeros(PATCH_SZ + 1, PATCH_SZ + 1);
-        const _patch = this.genZeros(PATCH_SZ + 1, PATCH_SZ + 1);
-        const DX = [];
-        const DY = [];
-        const dsize = this.extended ? 128: 64;
-        // TODO
-        const start = 0;
-        const end = N;
-        const height = sum.length;
-        const width = sum[0].length;
 
-        for (let k = k1; k < k2; k++) {
-            let vec = [];
-            let dx_t = [];
-            let dy_t = [];
-            let kp = {};
-            let size = kp.length;
-            let s = size * 1.2 / 9.0;
+        for (let k = 0; k < kps; k++) {
+            const dx_t = this.genZeros(NX);
+            const dy_t = this.genZeros(NY);
+            const size = kp.size;
+            const s = size * 1.2 / 9.0;
+            const gradWaveSize = 2 * Math.round(2 * s);
             // const center = kp.pt;
             const center = {
                 x: kp.x,
                 y: kp.y
             };
+            let kp = this.keypoints[k];
+            let descriptorDir = 360.0 - 90.0;
+            let squareMag = 0;
+            let dOffset = 0;
 
-            let gradWaveSize = 2 * Math.round(2 * s);
             if (height < gradWaveSize || width < gradWaveSize) {
                 kp.splice(0, kp.length); 
                 continue;
             }
-            let descriptorDir = 270.0;
-            if (this.upright === 0) {
+            if (!this.upright) {
+                let a1 = 0;
                 this.resizeHaarPttern(dx_s, dx_t, NX, 4, gradWaveSize, sum[0].length); 
                 this.resizeHaarPttern(dy_s, dy_t, NX, 4, gradWaveSize, sum[0].length); 
-                for (let k1 = 0, let nangle = 0; k1 < oriSamples; k1++) {
+                for (let k1 = 0; k1 < oriSamples; k1++) {
                     const x = Math.round(center.x + apt[k1].x * s - (gradWaveSize - 1) * 0.5);
                     const y = Math.round(center.y + apt[k1].y * s - (gradWaveSize - 1) * 0.5);
                     if (y < 0 || y >= height - gradWaveSize ||
@@ -456,24 +485,28 @@ class SURF {
                     };
                     const vx = this.calcHaarPattern(sum, dx_t, 2, sumOffset);
                     const vy = this.calcHaarPattern(sum, dy_t, 2, sumOffset);
-                    X[nangle] = vx * aptw[k1];
-                    Y[nangle] = vy * aptw[k1];
-                    nangle += 1;
+                    X[a1] = vx * aptw[k1];
+                    Y[a1] = vy * aptw[k1];
+                    a1 += 1;
                 }
-                if (nangle === 0){
+                if (a1 === 0){
                     kp.splice(0, kp.length); 
                     continue;
                 }
                 //TODO phase
-                phase(X, Y, angle, true);
+                // true mean in degrees
+                // phase(X, Y, angle, true);
+                for (let i = 0; i < X.length; i++) {
+                    angle[i] = Math.atan2(Y[i], X[i]) * 180.0 / Math.PI;
+                }
                 let bestX = 0;
                 let bestY = 0;
                 let descriptorMod = 0;
-                for (let i = 0; i < 360; i++) {
+                for (let i = 0; i < 360; i += SURF_ORI_SEARCH_INC) {
                     let sumX = 0;
                     let sumY = 0;
                     let tempMod = 0;
-                    for (let j = 0; j < nangle; j++) {
+                    for (let j = 0; j < a1; j++) {
                         let d = Math.abs(Math.round(angle[j]) - i);
                         if (d < ORI_WIN / 2 || d < 360 - ORI_WIN / 2) {
                             sumX += X[j];
@@ -490,23 +523,21 @@ class SURF {
                 descriptorDir = Math.atan2(-bestY, bestX);
             }
             kp.angle = descriptorDir;
-            if (!descriptor || !descriptor.data) {
+            if (!this.descriptors || !this.descriptors[0]) {
                 continue;
             }
 
-            const winSize = Math.round((PATCH_SZ + 1) * s);
+            const winSize = Math.floor((PATCH_SZ + 1) * s);
             const win = this.genZeros(winSize, winSize);
-            if (!upright) {
+            if (!this.upright) {
                 descriptorDir *= Math.PI / 180.0;
                 const sinDir = - Math.sin(descriptorDir);
                 const cosDir = Math.cos(descriptorDir);
-                const winOffset = -(win_size - 1) * 0.:
+                const winOffset = -(win_size - 1) * 0.5:
                 const startX = center.x + winOffset * cosDir + winOffset * sinDir;
                 const starty = center.x - winOffset * cosDir + winOffset * sinDir;
-                const width1 = img.bitmap.width - 1;
-                const height1 = img.bitmap.height - 1;
-                // TODO step
-                const imgStep = img.step;
+                const width1 = width - 1;
+                const height1 = height - 1;
                 const data = img.bitmap.data;
                 for (let i = 0; i < winSize; i++, startX += sinDir, startY += cosDir) {
                     const pixelX = startX;
@@ -514,106 +545,105 @@ class SURF {
                     for (let j = 0; j < winSize; j++, pixelX += cosDir, pixelY -= sinDir) {
                         const ix = Math.floor(pixelX);
                         const iy = Math.floor(pixelY);
+                        const idx = iy * width * 4 + ix;
                         if (ix < width1 && iy < height1) {
                             const a = pixelX - ix;
                             const b = pixelY - iy;
-                            win[i][j] = Math.round(data[0] * (1.0 - a) * (1.0 - b) + data[1] * a * (1.0 - b) + 
-                                data[imgStep] * (1.0 - a) * b + data[imgStep + 1] * a * (1.0 - b));
+                            win[i][j] = Math.round(data[idx] * (1.0 - a) * (1.0 - b) + data[idx + 1] * a * (1.0 - b) + 
+                                data[idx + width * 4] * (1.0 - a) * b + data[idx + width * 4 + 1] * a * (1.0 - b));
                         } else {
                             const x = Math.min(Math.max(Math.round(pixelX), 0), width1);
-                            const y = Math.min(Math.max(Math.round(pixelY), 0), width1);
-                            win[i][j] = data[y][x];
-                        }
-                    }
-                } else {
-                    const winOffset = -(winSize - 1) * 0.5;
-                    const startX = Math.round(center.x + winOffset);
-                    const startY = Math.round(center.y - winOffset);
-                    for (let i = 0; i < winSize; i++, startX++) {
-                        const pixelX = startX;
-                        const pixelY = startY;
-                        for (let j = 0; j < winSize; j++, pixelY--) {
-                            const x = Math.max(pixelX, 0);
-                            const y = Math.max(pixelY, 0);
-                            x = Math.min(x, width1);
-                            y = Math.min(y, height1);
-                            win[i][j] =  data[y][x];
+                            const y = Math.min(Math.max(Math.round(pixelY), 0), height1);
+                            win[i][j] =  data[y * width * 4 + x];
                         }
                     }
                 }
-                // TODO resize
-                resize(win, patch, patch.length, 0, 0, INTER_AREA);
-                for (let i =  0; i < PATCH_SZ; i++) {
-                    for (let j =  0; j < PATCH_SZ; j++) {
-                        const dw = DW[i * PATCH_SZ + j];
-                        cosnt vx = (PATCH[i][j + 1] - PATCH[i][j] + PATCH[i + 1][j + 1]  PATCH[i + 1][j]) * dw; 
-                        cosnt vx = (PATCH[i + 1][j] - PATCH[i][j] + PATCH[i + 1][j + 1]  PATCH[i][j + 1]) * dw; 
-                        DX[i][j] = vx;
-                        DX[i][j] = vy;
-                    }
-                    vec = descriptors[k];
-                    for (let k1 = 0; k1 < dsize; k1++) {
-                        vec[k1] = 0;
-                    }
-                    let squareMag = 0;
-                    if (this.extended) {
-                        for (let i = 0; i < 4; i++) {
-                            for (let j = 0; j < 4; j++) {
-                                for (let y = i * 5; y < i * 5 + 5; y++) {
-                                    for (let x = j * 5; x < j * 5 + 5; x++) {
-                                        const tx = DX[y][x];
-                                        const ty = DY[y][x];
-                                        // TODO fabs
-                                        if (ty >= 0) {
-                                            vec[0] += tx;
-                                            vec[1] += Math.abs(tx);
-                                        } else {
-                                            vec[2] += tx;
-                                            vec[3] += Math.abs(tx);
-                                        }
-                                        if (tx >= 0) {
-                                            vec[4] += ty;
-                                            vec[5] += Math.abs(ty);
-                                        } else {
-                                            vec[6] += ty;
-                                            vec[7] += Math.abs(ty);
-                                        }
-                                    }
-                                }
-                                for (let k1 = 0; k1 < 8; k1++) {
-                                    squareMag += vec[k1] * vec[k1];
-                                }
-                                // TODO
-                                vec += 8;
-                            }
-                        }
-                    } else {
-                        for (let i = 0; i < 4; i++) {
-                            for (let j = 0; j < 4; j++) {
-                                for (let y = i * 5; y < i * 5 + 5; y++) {
-                                    for (let x = j * 5; x < j * 5 + 5; x++) {
-                                        const tx = DX[y][x];
-                                        const ty = DY[y][x];
-                                        vec[0] += tx;
-                                        vec[1] += ty;
-                                        vec[2] += Math.abs(tx);
-                                        vec[3] += Math.abs(ty);
-                                    }
-                                }
-                                for (let k1 = 0; k1 < 4; k1++) {
-                                    squareMag += vec[k1] * vec[k1];
-                                }
-                                // TODO
-                                vec += 4;
-                            }
-                        }
-                    }
-                    vec = descriptors[k];
-                    const scale = 1.0 / (Math.sqrt(squareMag + 1e-6));
-                    for (let k1 = 0; k1 < 4; k1++) {
-                        vec[k1] *= scale;
+            } else {
+                const winOffset = -(winSize - 1) * 0.5;
+                const startX = Math.round(center.x + winOffset);
+                const startY = Math.round(center.y - winOffset);
+                for (let i = 0; i < winSize; i++, startX++) {
+                    const pixelX = startX;
+                    const pixelY = startY;
+                    for (let j = 0; j < winSize; j++, pixelY--) {
+                        const x = Math.max(pixelX, 0);
+                        const y = Math.max(pixelY, 0);
+                        x = Math.min(x, width1);
+                        y = Math.min(y, height1);
+                        // win[i][j] =  data[y][x];
+                        win[i][j] =  data[y * width * 4 + x];
                     }
                 }
+            }
+            // TODO resize
+            // not in use?
+            // resize(win, _patch, _patch.length, 0, 0, INTER_AREA);
+            // _patch = this.resize(win, _patch.length);
+            for (let i =  0; i < PATCH_SZ; i++) {
+                for (let j =  0; j < PATCH_SZ; j++) {
+                    const dw = DW[i * PATCH_SZ + j];
+                    cosnt vx = (PATCH[i][j + 1] - PATCH[i][j] + PATCH[i + 1][j + 1]  PATCH[i + 1][j]) * dw; 
+                    cosnt vx = (PATCH[i + 1][j] - PATCH[i][j] + PATCH[i + 1][j + 1]  PATCH[i][j + 1]) * dw; 
+                    DX[i][j] = vx;
+                    DX[i][j] = vy;
+                }
+            }
+            for (let k1 = 0; k1 < dSize; k1++) {
+                this.descriptors[k][k1] = 0;
+            }
+            if (this.extended) {
+                for (let i = 0; i < 4; i++) {
+                    for (let j = 0; j < 4; j++) {
+                        for (let y = i * 5; y < i * 5 + 5; y++) {
+                            for (let x = j * 5; x < j * 5 + 5; x++) {
+                                const tx = DX[y][x];
+                                const ty = DY[y][x];
+                                // TODO fabs
+                                if (ty >= 0) {
+                                    this.descriptors[k][0 + dOffset] += tx;
+                                    this.descriptors[k][1 + dOffset] += Math.abs(tx);
+                                } else {
+                                    this.descriptors[k][2 + dOffset] += tx;
+                                    this.descriptors[k][3 + dOffset] += Math.abs(tx);
+                                }
+                                if (tx >= 0) {
+                                    this.descriptors[k][4 + dOffset] += ty;
+                                    this.descriptors[k][5 + dOffset] += Math.abs(ty);
+                                } else {
+                                    this.descriptors[k][6 + dOffset] += ty;
+                                    this.descriptors[k][7 + dOffset] += Math.abs(ty);
+                                }
+                            }
+                        }
+                        for (let k1 = 0; k1 < 8; k1++) {
+                            squareMag += this.descriptors[k][k1] * this.descriptors[k][k1];
+                        }
+                        dOffset += 8;
+                    }
+                }
+            } else {
+                for (let i = 0; i < 4; i++) {
+                    for (let j = 0; j < 4; j++) {
+                        for (let y = i * 5; y < i * 5 + 5; y++) {
+                            for (let x = j * 5; x < j * 5 + 5; x++) {
+                                const tx = DX[y][x];
+                                const ty = DY[y][x];
+                                this.descriptors[k][0 + dOffset] += tx;
+                                this.descriptors[k][1 + dOffset] += ty;
+                                this.descriptors[k][2 + dOffset] += Math.abs(tx);
+                                this.descriptors[k][3 + dOffset] += Math.abs(ty);
+                            }
+                        }
+                        for (let k1 = 0; k1 < 4; k1++) {
+                            squareMag += [k1] * [k1];
+                        }
+                        dOffset += 4;
+                    }
+                }
+            }
+            const scale = 1.0 / (Math.sqrt(squareMag + 1e-6));
+            for (let k1 = 0; k1 < dSize; k1++) {
+                this.descriptors[k][k1] *= scale;
             }
         }
     }
@@ -637,97 +667,85 @@ class SURF {
         return res;
     }
 
-    detectAndCompute(mask, keypoints, descriptors, useProvidedKeypoints) {
-        const img = Jimp.read('/c1.jpg');
+    // detectAndCompute(mask, keypoints, descriptors, useProvidedKeypoints) {
+    async detectAndCompute() {
+        const img = await Jimp.read(this.filePath);
         img = img.greyscale();
+        this.height = img.bitmap.height;
+        this.width = img.bitmap.width;
         this.sum = this.integral(img);
         if (!this.useProvidedKeyPoints) {
-            if (!this.mask) {
-                const mask1 = this.matrixScalarCompare(mask, 1, 'min');
+            if (!this.mask[0]) {
+                const mask1 = this.matrixScalarCompare(this.mask, 1, 'min');
                 this.maskSum = this.integral(mask1);
             }
             this.fastHessianDetector();
-            if (!this.mask) {
-                for (let i = 0; i < keypoints.length;) {
-                    const pt = keypoints[i].pt;
-                    if (this.mask[pt.y][pt.x] === 0) {
+            if (!this.mask[0]) {
+                for (let i = 0; i < this.keypoints.length;) {
+                    const { x, y } = this.keypoints[i];
+                    if (this.mask[y][x] === 0) {
                         // TODO
                         // erase
-                        keypoints.splice(i, 1);
+                        this.keypoints.splice(i, 1);
                         continue; // keep "i"
                     }
                     i++;
                 }
             }
         }
-        const N = keypoints.length;
-        if (N > 0) {
+        const kps = this.keypoints.length;
+        const doDescriptors = this.doDescriptors;
+        if (kps > 0) {
             const dWidth = this.extended ? 128: 64;
             if (doDescriptors) {
-                this.descriptors = this.genZeros(N, dWidth);
+                this.descriptors = this.genZeros(kps, dWidth);
             }
-            this.invoke(N);
-
-            for (let i = 0, let j = 0; i < N; i++) {
+            this.invoke(img, kps);
+            for (let i = 0, let j = 0; i < kps; i++) {
                 if (kepoints[i].length > 0) {
                     if (i > j) {
-                        keypoints[j] = keypoints[i];
+                        this.keypoints[j] = this.keypoints[i];
                         if (doDescriptors) {
                             // TODO
+                            // memcpyt(dst, src, ...);
                             // memcpy(descriptors.ptr(j), descriptors.ptr(i), dsize);
+                            this.decriptors[j] = this.descriptors[i];
                         }
                     }
                     j += 1;
                 }
             }
-            if (N > j) {
-                // TODO
-                keypoints.resize(N);
+            if (kps > j) {
+                kps = j;
+                // this.keypoints.resize(kps);
+                this.keypoints.splice(kps, this.keypoints - kps);
                 if (doDescriptors) {
-                    const d = [];
-                    for (let k = 0; k < N; k++) {
-                        d.push(descriptors[k]);
+                    let d = [];
+                    for (let k = 0; k < kps; k++) {
+                        // TODO
+                        d.push(this.descriptors[k]);
                     }
                     this.descriptors = d;
-
                 }
             }
         }
     }
 
-    integral(img) {
-        const height = img.bitmap.height;
-        const width = img.bitmap.width;
-        const data = img.bitmap.data;
-        const sum = this.genZeros(height, width);
-        // TODO
-        for (let i = 0; i < height; i++) {
-            for (let j = 0; j < width; i++) {
-                if (i === 0) {
-                    const idx = j * 4;
-                    sum[0][j] += data[idx];
-                    continue;
-                } else if (j === 0) {
-                    const idx = i * width * 4;
-                    sum[i][0] += data[idx];
-                } else {
-                    const idx = i * width * 4 + j * 4;
-                    sum[i][j] = sum[i - 1][j] + sum[i][j - 1] - sum[i - 1][j - 1] + data[idx];
-                }
-            }
+    // create(hessianThreshold, octaves, layers, extended, upright) {
+    create(filePath, options) {
+        if (filePath) {
+            return;
         }
-
-        return sum;
-    }
-
-    create(threshold, octaves, layers, extended, upright) {
-        this.threshold = threshold;
-        this.octaves = octaves;
-        this.layers = layers;
-        this.extended = extended;
-        this.upright = upright;
+        // default: 100, 4, 2, 64, true
+        this.filePath = filePath;
+        this.hessianThreshold = options.hessianThreshold || 100;
+        this.octaves = options.octaves || 4;
+        this.layers = options.layers || 2;
+        this.extended = options.extended || 64;
+        this.upright = options.upright || true;
 
         this.detectAndCompute();
     }
+};
 
-}
+export default SURF;
