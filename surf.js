@@ -3,34 +3,86 @@ import Jimp from 'jimp';
 const ORI_RADIUS = 6;
 const ORI_WIN = 60;
 const PATCH_SZ = 20;
+const SURF_ORI_SEARCH_INC = 5;
+const SURF_ORI_SIGMA = 2.5;
+const SURF_DESC_SIGMA = 3.3;
+const SURF_HAAR_SIZE0 = 9;
+const SURF_HAAR_SIZE_INC = 6;
 
 class SURF {
     constructor() {
-        this.upright = 0;
-        this.sampleStep = 2;
         this.sum = [];
         this.maskSum = [];
         this.sizes = [];
         this.dets = [];
         this.traces = [];
-        this.octaves = [];
-        this.layers = [];
+        this.descriptors = [];
+        this.middleIndices = [];
+        this.keypoints = [];
+        /*
+        this.keypoint = {
+            x: 0,
+            y: 0
+            size: 0,
+            angle: 0,
+            octave: 0,
+            response: 0,
+            classID: -1 
+        };
+        */
+        this.range = [0, 0];
+        this.octaves = 4;
+        this.octaveLayers = 3;
+        this.sampleStep = 2;
+        this.hessianThreshold = 100;
+        this.useProvidedKeypoints = false;
+        this.upright = false;
         this.extended = false;
     }
 
     genZeros(height, width) {
-        let arr = [];
-        let res = [];
-        for (let i = 0; i < height; i++) {
-            arr.push(0);
+        if (height === undefined || height < 1 || width < 1) {
+            return [];
+        } else if (width === undefined) {
+            let arr1D = [];
+            for (let i = 0; i < height; i++) {
+                arr1D.push(0);
+            }
+            return arr1D;
+        } else {
+            let arr1D = [];
+            let arr2D = [];
+            for (let i = 0; i < height; i++) {
+                arr1D.push(0);
+            }
+            for (let i = 0; i < width; i++) {
+                arr2D.push(arr1D);
+            }
+            return arr2D;
         }
-        for (let i = 0; i < width; i++) {
-            res.push(arr);
-        }
-        return res;
     }
 
-    calcHaarPattern(src, hf, N, hOffset, offset) {
+    genMatrices(N, height, width) {
+        if (N === undefined || height === undefined || width === undefined || N < 1 || height < 1 || width < 1) {
+            return [];
+        } else {
+            let arr1D = [];
+            let arr2D = [];
+            let arr3D = [];
+            for (let i = 0; i < height; i++) {
+                arr1D.push(0);
+            }
+            for (let i = 0; i < width; i++) {
+                arr2D.push(arr1D);
+            }
+            for (let i = 0; i < N; i++) {
+                arr3D.push(arr2D);
+            }
+            return arr3D;
+        }
+    }
+
+    calcHaarPattern(src, hf, N, hOffset, wOffset) {
         let d = 0;
         const width = src[0].length;
         const { hOffset, wOffset } = offset;
@@ -111,7 +163,7 @@ class SURF {
         }
     }
 
-    interpolateKeyPoint(N9, dx, dy, ds, kpt) {
+    interpolateKeypoint(N9, dx, dy, ds, kpt) {
         const b = [-(N9[1][5] - N9[1][3]) * 0.5 , -(N9[1][7] - N9[1][1]) * 0.5, -(N9[2][4] - N9[0][4]) * 0.5];
         const A = [N9[1][3] - 2 * N9[1][4] + N9[1][5],
             (N9[1][8] - N9[1][6] - N9[1][2] + N9[1][0]) * 0.25,
@@ -125,39 +177,72 @@ class SURF {
 
         // TODO
         const x = A.solve(b, decomp_lu);
-        const ok = (x[0] !== 0 || x[1] !== 0 || x2 !== 0) &&
+        const isOK = (x[0] !== 0 || x[1] !== 0 || x2 !== 0) &&
             Math.abs(x[0]) <= 1 && Math.abs(x[1]) <= 1 && Math.abs(x[2]) <= 1;
 
-        if (ok) {
+        if (isOK) {
             kpt.pt.x += x[0] * dx;
             kpt.pt.y += x[1] * dy;
-            kpt.size = Math.round(kpt.size + x[2] * ds);
+            kpt.size = Math.round(kpt.length + x[2] * ds);
         }
-        return ok;
+        return isOK;
     }
 
-    findInvoker(sum, mask_sum, dets, traces, sizes, sampleSteps, middleIndices, keypoints, octaveLayers, hessianThreshold) {
+    buildInvoker(totalLayers) {
+        for (let i = 0; i < totalLayers; i++) {
+            this.calcLayerDetAndTrace();
+        }
 
     }
 
-    findMaxInLayer(sum, mask_sum, dets, traces, sizes, keypoints, octave, layer, hessianThreshold, sampleStep) {
+    // findInvoker(sum, mask_sum, dets, traces, sizes, sampleSteps, middleIndices, keypoints, octaveLayers, hessianThreshold) {
+    findInvoker(middleLayers) {
+        for (let i = 0; i < middleLayers; i++) {
+            const octave = i / this.octaveLayers;
+            const layer = this.middleIndices[i];
+            this.findMaxInLayer(octave, layer);
+        }
+
+    }
+
+    // findMaxInLayer(sum, mask_sum, dets, traces, sizes, keypoints, octave, layer, hessianThreshold, sampleStep) {
+    findMaxInLayer(octave, layer) {
         const dm = [0, 0, 9, 9, 1];
         const Dm = this.genZeros(1, 5);
-        const size = sizes[layer];
-        const layer_rows = (sum.length - 1) / sampleStep;
-        const layer_cols = (sum[0].length - 1) / sampleStep;
+        const dets = this.dets;
+        const sizes = this.sizes;
+        const traces = this.traces;
+        const maskSum = this.maskSum;
+        const size = this.sizes[layer];
+        const sampleStep = this.sampleSteps[layer];
+        const height = this.sum.length;
+        const width = this.sum[0].length;
+        const layerHeight = height / sampleStep;
+        const layerWidth = width / sampleStep;
+        const hessianThreshold = this.hessianThreshold;
         const margin = (sizes[layer + 1] / 2) / sampleStep + 1;
-        if (!mask_sum) {
-            this.resizeHaarPattern(dm, Dm, 9, size, mask_sum[0].length);
+        if (!maskSum[0]) {
+            this.resizeHaarPattern(dm, Dm, 9, size, maskSum[0].length);
         }
-        // TODO elemSize
-        const step = Math.floor(dets[layer].step / dets[layer].elemSize());
-        for (let i = margin; i < layer_rows - margin; i++) {
-            for (let j = margin; j < layer_cols - margin; j++) {
+
+        // TODO
+        // const step = Math.floor(dets[layer].step / dets[layer].elemSize());
+        // const step = width;
+        const step = dets[layer][0].length;
+
+        // for (let i = 0; i < layerHeight; i++) {
+        //     for (let j = 0; j < layerWidth; j++) {
+        for (let i = margin; i < layerHeight - margin; i++) {
+             for (let j = margin; j < layerWidth - margin; j++) {
                 const val = dets[layer][j];
                 if (val > hessianThreshold) {
-                    const sum_i = sampleStep * (i - size * 0.5 / sampleStep);
-                    const sum_j = sampleStep * (j - size * 0.5 / sampleStep);
+                    const hOffset = sampleStep * (i - size * 0.5 / sampleStep);
+                    const wOffset = sampleStep * (j - size * 0.5 / sampleStep);
+                    const d1 = dets[layer - 1];
+                    const d2 = dets[layer];
+                    const d3 = dets[layer + 1];
+
+                    /*
                     const N9 = [[dets[layer - 1][-step - 1], dets[layer - 1][-step], dets[layer - 1][-step + 1],
                         dets[layer - 1][-1], dets[layer - 1][0], dets[layer - 1][1],
                         dets[layer - 1][step - 1], dets[layer - 1][step], dets[layer - 1][step + 1]],
@@ -167,9 +252,23 @@ class SURF {
                         [dets[layer + 1][-step - 1], dets[layer + 1][-step], dets[layer + 1][-step + 1],
                             dets[layer + 1][-1], dets[layer + 1][0], dets[layer + 1][1],
                             dets[layer + 1][step - 1], dets[layer + 1][step], dets[layer + 1][step + 1]]];
+                    */
+                    const N9 = [[d1[-step - 1], d1[-step], d1[-step + 1],
+                        d1[-1], d1[0], d1[1],
+                        d1[step - 1], d1[step], d1[step + 1]],
+                        [d2[-step - 1], d2[-step], d2[-step + 1],
+                            d2[-1], d2[0], d2[1],
+                            d2[step - 1], d2[step], d2[step + 1]],
+                        [d3[-step - 1], d3[-step], d3[-step + 1],
+                            d3[-1], d3[0], d3[1],
+                            d3[step - 1], d3[step], d3[step + 1]]];
 
-                    if (!mask_sum) {
-                        const mval = this.calcHaarPattern(mask_sum, Dm, 1);
+                    if (!maskSum[0]) {
+                    const maskSumOffset = {
+                        hOffset: hOffset,
+                        wOffset: wOffset 
+                    };
+                        const mval = this.calcHaarPattern(maskSum, Dm, 1, maskSumOffset);
                         if (mval < 0.5) {
                             continue;
                         }
@@ -177,17 +276,26 @@ class SURF {
 
                     // TODO N9 max
                     if(val > Math.max(N9)) {
-                        const center_i = sum_i + (size - 1) * 0.5;
-                        const center_j = sum_j + (size - 1) * 0.5;
+                        const hCenter = hOffset + (size - 1) * 0.5;
+                        const wCenter = wOffset + (size - 1) * 0.5;
 
-                        kpt(center_j, center_i, sizes[layer] - 1, -1, val, octave, (traces[layer][j] > 0) - (traces[layer][j] < 0));
+                        // const kpt = this.genKeyPoint(hCenter, wCenter, sizes[layer], -1, val, octave, (traces[layer][j] > 0) - (traces[layer][j] < 0));
+                        const kpt = {
+                            x: wCenter,
+                            y: hCenter, 
+                            size: sizes[layer],
+                            angle: -1,
+                            response: val,
+                            octave: octave
+                            classID: (traces[layer][j] > 0) - (traces[layer][j] < 0)
+                        };
                         const ds = size - sizes[layer - 1];
-                        const interp_ok = this.interpolageKeypoint(N9, sampleStep, sampleStep, ds, kpt);
+                        const interpOK = this.interpolateKeypoint(N9, sampleStep, sampleStep, ds, kpt);
 
-                        if (interp_ok) {
+                        if (interpOK) {
                             // TODO
                             // cv::AutoLock
-                            keypoints.push(kpt);
+                            this.keypoints.push(kpt);
                         }
                     }
                 }
@@ -195,63 +303,105 @@ class SURF {
         }
     }
 
-    genKeyPoint() {
-    }
-
-    fastHessianDetector(sum, mask_sum, keypoints, octaves, octaveLayers, hessianThreshold) {
+    // fastHessianDetector(sum, mask_sum, keypoints, octaves, octaveLayers, hessianThreshold) {
+    fastHessianDetector() {
         const sampleStep0 = 1;
         const totalLayers = (octaveLayers + 2) * octaves;
         const middleLayers = octaveLayers * octaves;
-        // TODO
-        const dets = [];
-        const traces = [];
-        const size = [];
-        const sampleSteps = [];
-        const middleIndices = [];
+        const octaves = this.octaves;
+        const octaveLayers = this.octaveLayers;
+        const height = this.sum.length;
+        const width = this.sum[0].length;
+        // this.dets = this.genMatrices(totalLayers, height, width);
+        // this.traces = this.genMatrices(totalLayers, height, width);
+
+        this.sizes = this.genZeros(totalLayers);
+        this.sampleSteps = this.genZeros(totalLayers);
+        this.middleIndices = this.genZeros(middleIndices);
 
         // clear()
-        keypoints.splice(0, keypoint.length);
+        this.keypoints.splice(0, keypoint.length);
         let index = 0;
         let middleIndex = 0;
         let step = sampleStep0;
         for (let octave = 0; octave < octaves; octave++) {
-            for (let layer = 0; layer< octaveLayers; layer++) {
+            for (let layer = 0; layer < octaveLayers + 2; layer++) {
                 // TODO
-                detx[index].push();
-                sampleSteps[index] = step;
+                this.dets.push(this.genZeros(height / step, width / step));
+                this.traces.push(this.genZeros(height / step, width / step));
+                this.sizes[index] = (SURF_HAAR_SIZE0 + SURF_HAAR_SIZE_INC * layer) << octave;
+                this.sampleSteps[index] = step;
                 if (0 < layer && layer <= octaveLayers) {
-                    middleIndices[middleIndex] = index;
+                    this.middleIndices[middleIndex] = index;
                     middleIndex += 1;
                 }
                 index += 1;
             }
             step *= 2;
         }
-        findInvoker(sum, mask_sum, dets, traces, sizes, sampleSteps, middleIndices, keypoints, octaveLayers, hessianThreshold);
+
+        // buildInvoker(sum, sizes, sampleSteps, dets, traces);
+        // findInvoker(sum, mask_sum, dets, traces, sizes, sampleSteps, middleIndices, keypoints, octaveLayers, hessianThreshold);
+        this.buildInvoker(totalLayers);
+        this.findInvoker(middleLayers);
         // TODO
-        keypoints.sort();
+        // keypoints.sort();
+        // FIXME
+        // keypoints.sort((a, b) => a.response - b.response);
+        keypoints.sort((a, b) => b.response - a.response);
+    }
+    
+    createGaussianKernel(n, SIGMA) {
+        let sum = 0;
+        let kernel = [];
+        const scale = -0.5 / (sigma * sigma);
+        const sigma = Math.max(SIGMA, 0);
+        const n2 = Math.floor(n / 2);
+        for (let i = 0; i < n; i++) {
+            const values = [];
+            for (let j = 0; j < n; j++) {
+                let d2 = (i - n2) * (i - n2) + (j - n2) * (j - n2);
+                values.push(Math.exp(d2 * scale));
+                sum += values[j];
+            }
+            kernel.push(values);
+        }
+        for (let i = 0; i < n; i++) {
+            for (let j = 0; j < n; j++) {
+                kernel[i][j] /= sum;
+            }
+        }
+        return kernel;
     }
 
+    // TODO
     invoker() {
         const oriSampleBound = (2 * ORI_RADIUS + 1) * (2 * ORI_RADIUS + 1);
         // TODO
-        const apt = [];
-        const aptw = [];
-        const DW = p[];
-        // TODO
-        const gOri = getGaussianKernel();
-        const oriSample = 0;
-        // TODO
-        // for () {...
-        const gDest = getGaussianKernel();
+        const apt = this.genZeros(oriSampleBound);
+        const aptw = this.genZeros(oriSampleBound);
+        const DW = this.genZeros(PATCH_SZ * PATCH_SZ);
+        const gOri = createGaussianKernel(2 * ORI_RADIUS + 1, SURF_ORI_SIGMA);
+        const gDesc = createGaussianKernel(PATCH_SZ, SURF_DESC_SIGMA);
+        this.OriSamples = 0;
+        for (let i = -ORI_RADIUS; i <= ORI_RADIUS; i++) {
+            for (let j = -ORI_RADIUS; j <= ORI_RADIUS; j++) {
+                if (i * i + j * j <= ORI_RADIUS * ORI_RADIUS) {
+                    const weight_ = gOri[i + ORI_RADIUS][0] * gOri[j + ORI_RADIUS][0];
+                    apt.push([i, j]);
+                    aptw.push(weight_);
+                    this.OriSamples += 1;
+                }
+            }
+        }
         for (let i = 0; i < PATCH_SZ; i++) {
             for (let j = 0; j < PATCH_SZ; j++) {
-                DW[i * PATCH_SZ + j] = gDest[i][0] * gDest[j][0];
+                DW[i * PATCH_SZ + j] = gDesc[i][0] * gDesc[j][0];
             }
         }
     }
 
-    invokerOperator() {
+    invoke(N) {
         const NX = 2;
         const NY = 2;
         const dx_s =[[0, 0, 2, 4, -1], [2, 0, 4, 4, 1]];
@@ -267,18 +417,9 @@ class SURF {
         const dsize = this.extended ? 128: 64;
         // TODO
         const start = 0;
-        const end = 0;
+        const end = N;
         const height = sum.length;
         const width = sum[0].length;
-
-        // TODO
-        // seems no need
-        // let maxSize = 0;
-        // for (let k = start; k < end; k++) {
-        //     maxSize = Math.max(maxSize, keypoints[k].length);
-        // }
-        // const imaxSize = Math.max(1, Math.ceil((PATCH_SZ + 1) * maxSize * 1.2 / 9.0));
-        // winbuf
 
         for (let k = k1; k < k2; k++) {
             let vec = [];
@@ -287,7 +428,12 @@ class SURF {
             let kp = {};
             let size = kp.length;
             let s = size * 1.2 / 9.0;
-            const center = kp.pt;
+            // const center = kp.pt;
+            const center = {
+                x: kp.x,
+                y: kp.y
+            };
+
             let gradWaveSize = 2 * Math.round(2 * s);
             if (height < gradWaveSize || width < gradWaveSize) {
                 kp.splice(0, kp.length); 
@@ -420,17 +566,17 @@ class SURF {
                                         // TODO fabs
                                         if (ty >= 0) {
                                             vec[0] += tx;
-                                            vec[1] += fabs(tx);
+                                            vec[1] += Math.abs(tx);
                                         } else {
                                             vec[2] += tx;
-                                            vec[3] += fabs(tx);
+                                            vec[3] += Math.abs(tx);
                                         }
                                         if (tx >= 0) {
                                             vec[4] += ty;
-                                            vec[5] += fabs(ty);
+                                            vec[5] += Math.abs(ty);
                                         } else {
                                             vec[6] += ty;
-                                            vec[7] += fabs(ty);
+                                            vec[7] += Math.abs(ty);
                                         }
                                     }
                                 }
@@ -450,8 +596,8 @@ class SURF {
                                         const ty = DY[y][x];
                                         vec[0] += tx;
                                         vec[1] += ty;
-                                        vec[2] += fabs(tx);
-                                        vec[3] += fabs(ty);
+                                        vec[2] += Math.abs(tx);
+                                        vec[3] += Math.abs(ty);
                                     }
                                 }
                                 for (let k1 = 0; k1 < 4; k1++) {
@@ -471,66 +617,117 @@ class SURF {
             }
         }
     }
-
-    detectAndCompute(img, mask, keypoints, descriptors, useProvidedKeypoints) {
-        img.greyscale();
-        // TODO
-        const sum = integral(img);
-        if (!useProvidedKeyPoints) {
-            if (!mask) {
-                const mask1 = Math.min(mask, 1);
-                const maskSum = integral(mask1);
+    
+    matrixScalarCompare(mat, scalar, type) {
+        const height = mat.length;
+        const width = mat[0].length;
+        const res = this.genZeros(height, width);
+        for (let i = 0; i < height; i++) {
+            for (let i = 0; i < height; i++) {
+                const val = mat[i][j];
+                if (type === 'min') {
+                    res[i][j] = val < scalar ? val : scalar;
+                } else if (type === 'max') {
+                    res[i][j] = val > scalar ? val : scalar;
+                } else {
+                    res[i][j] = val;
+                }
             }
-            fastHessianDetector(sum, maskSum, keypoints, octaves, octaveLayers, hessianThreshold);
-            if (!mask) {
+        }
+        return res;
+    }
+
+    detectAndCompute(mask, keypoints, descriptors, useProvidedKeypoints) {
+        const img = Jimp.read('/c1.jpg');
+        img = img.greyscale();
+        this.sum = this.integral(img);
+        if (!this.useProvidedKeyPoints) {
+            if (!this.mask) {
+                const mask1 = this.matrixScalarCompare(mask, 1, 'min');
+                this.maskSum = this.integral(mask1);
+            }
+            this.fastHessianDetector();
+            if (!this.mask) {
                 for (let i = 0; i < keypoints.length;) {
                     const pt = keypoints[i].pt;
-                    if (mask(pt.y, pt.x) === 0) {
+                    if (this.mask[pt.y][pt.x] === 0) {
                         // TODO
-                        keypoints.erase(i);
+                        // erase
+                        keypoints.splice(i, 1);
                         continue; // keep "i"
                     }
                     i++;
                 }
             }
         }
-        const N = keypoints.length();
-        if (doDescriptors) {
-            // const is1D = descriptors.type === '1D';
-            // if (is1D) {
-            // TODO
-            // } else {
-            // }
-            createDescriptor();
-        }
-        this.invoker();
-        for (let i = j = 0; i < N; i++) {
-            if (kepoints[i].length > 0 {
-                if (i > j) {
-                    keypoints[j] = keypoints[i];
-                    if (doDescriptors) {
-                        // TODO
-                        // memcpy(descriptors.ptr(j), descriptors.ptr(i), dsize);
-                    }
-                }
-                j += 1;
-            }
-        }
-        if (N > j) {
-            // TODO
-            keypoints.resize(N);
+        const N = keypoints.length;
+        if (N > 0) {
+            const dWidth = this.extended ? 128: 64;
             if (doDescriptors) {
-                const d = [];
-                for (let k = 0; k < N; k++) {
-                    d.push(descriptors[k]);
-                }
-                // this.descriptors = d;
+                this.descriptors = this.genZeros(N, dWidth);
+            }
+            this.invoke(N);
 
+            for (let i = 0, let j = 0; i < N; i++) {
+                if (kepoints[i].length > 0) {
+                    if (i > j) {
+                        keypoints[j] = keypoints[i];
+                        if (doDescriptors) {
+                            // TODO
+                            // memcpy(descriptors.ptr(j), descriptors.ptr(i), dsize);
+                        }
+                    }
+                    j += 1;
+                }
+            }
+            if (N > j) {
+                // TODO
+                keypoints.resize(N);
+                if (doDescriptors) {
+                    const d = [];
+                    for (let k = 0; k < N; k++) {
+                        d.push(descriptors[k]);
+                    }
+                    this.descriptors = d;
+
+                }
             }
         }
     }
 
+    integral(img) {
+        const height = img.bitmap.height;
+        const width = img.bitmap.width;
+        const data = img.bitmap.data;
+        const sum = this.genZeros(height, width);
+        // TODO
+        for (let i = 0; i < height; i++) {
+            for (let j = 0; j < width; i++) {
+                if (i === 0) {
+                    const idx = j * 4;
+                    sum[0][j] += data[idx];
+                    continue;
+                } else if (j === 0) {
+                    const idx = i * width * 4;
+                    sum[i][0] += data[idx];
+                } else {
+                    const idx = i * width * 4 + j * 4;
+                    sum[i][j] = sum[i - 1][j] + sum[i][j - 1] - sum[i - 1][j - 1] + data[idx];
+                }
+            }
+        }
+
+        return sum;
+    }
+
     create(threshold, octaves, layers, extended, upright) {
+        this.threshold = threshold;
+        this.octaves = octaves;
+        this.layers = layers;
+        this.extended = extended;
+        this.upright = upright;
+
+        this.detectAndCompute();
     }
 
 }
