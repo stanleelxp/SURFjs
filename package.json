@@ -1,0 +1,27 @@
+{
+  "name": "surfjs",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/stanleelxp/SURFjs.git"
+  },
+  "author": "Stanlee",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/stanleelxp/SURFjs/issues"
+  },
+  "homepage": "https://github.com/stanleelxp/SURFjs#readme",
+  "dependencies": {
+    "jimp": "~0.6.4",
+    "ml-matrix": "~6.0.0"
+  },
+  "devDependencies": {
+    "babel-preset-env": "^1.7.0",
+    "babel-register": "^6.26.0"
+  }
+}
