@@ -1,7 +1,8 @@
 // import Jimp from 'jimp';
 // import { solve } from 'ml-matrix'; // ~6.0.0
 const Jimp = require('jimp');
-const matrix = require('ml-matrix'); // ~6.0.0
+// const matrix = require('ml-matrix'); // ~6.0.0
+const { Matrix, solve, inverse } = require('ml-matrix'); // ~6.0.0
 
 const ORI_RADIUS = 6;
 const ORI_WIN = 60;
@@ -12,7 +13,15 @@ const SURF_DESC_SIGMA = 3.3;
 const SURF_HAAR_SIZE0 = 9;
 const SURF_HAAR_SIZE_INC = 6;
 
-let saveCount = 0;
+const OK = 0;
+const ERR_NEED_MORE_IMGS = 1;
+const ERR_HOMOGRAPHY_EST_FAIL = 2;
+const ERR_CAMERA_PARAMS_ADJUST_FAIL = 3;
+
+const PANORAMA = 0;
+const SCANS = 1;
+
+let imgCount = 0;
 
 class SURF {
     constructor() {
@@ -25,6 +34,7 @@ class SURF {
         this.descriptors = [];
         this.middleIndices = [];
         this.keypoints = [];
+        this.feature = {};
         this.octaves = 4;
         this.octaveLayers = 2;
         this.sampleStep = 2;
@@ -61,28 +71,6 @@ class SURF {
         }
     }
 
-    // not in use
-    genMatrices(N, height, width) {
-        if (N === undefined || height === undefined || width === undefined || N < 1 || height < 1 || width < 1) {
-            return [];
-        } else {
-            let arr1D = [];
-            let arr2D = [];
-            let arr3D = [];
-            for (let i = 0; i < height; i++) {
-                arr1D.push(0);
-            }
-            for (let i = 0; i < width; i++) {
-                arr2D.push(arr1D.slice());
-            }
-            for (let i = 0; i < N; i++) {
-                // wrong ?
-                arr3D.push(arr2D.slice());
-            }
-            return arr3D;
-        }
-    }
-
     getMax2D(src) {
         const height = src.length;
         const width = src[0].length;
@@ -103,7 +91,6 @@ class SURF {
         const sigma = Math.max(SIGMA, 0);
         const scale = 0.5 / (sigma * sigma);
         const n2 = Math.floor(0.5 * n);
-        // const n2 = 0.5 * n;
         for (let i = 0; i < n; i++) {
             let d2 = (i - n2) * (i - n2);
             kernel.push(Math.exp(-d2 * scale));
@@ -111,31 +98,6 @@ class SURF {
         }
         for (let i = 0; i < n; i++) {
             kernel[i] /= sum;
-        }
-        // console.log('kernel', kernel);
-        return kernel;
-    }
-
-    //not in use 
-    createGaussianKernel(n, SIGMA) {
-        let sum = 0;
-        let kernel = [];
-        const sigma = Math.max(SIGMA, 0);
-        const scale = -0.5 / (sigma * sigma);
-        const n2 = Math.floor(n / 2);
-        for (let i = 0; i < n; i++) {
-            let values = [];
-            for (let j = 0; j < n; j++) {
-                let d2 = (i - n2) * (i - n2) + (j - n2) * (j - n2);
-                values.push(Math.exp(d2 * scale));
-                sum += values[j];
-            }
-            kernel.push(values.slice());
-        }
-        for (let i = 0; i < n; i++) {
-            for (let j = 0; j < n; j++) {
-                kernel[i][j] /= sum;
-            }
         }
         return kernel;
     }
@@ -152,17 +114,12 @@ class SURF {
                     sum[i][j] = data[0];
                 } else if ( i === 0) {
                     const idx = j * 4;
-                    // console.log('idx ', idx);
                     sum[i][j] = sum[i][j - 1] + data[idx];
-                    // continue;
                 } else if (j === 0) {
                     const idx = i * width * 4;
-                    // console.log('idx1 ', idx);
-                    // console.log('i1 ', i);
                     sum[i][j] = sum[i - 1][j] + data[idx];
                 } else {
                     const idx = i * width * 4 + j * 4;
-                    // console.log('idx2 ', idx);
                     // FIXME can be faster
                     sum[i][j] = sum[i - 1][j] + sum[i][j - 1] - sum[i - 1][j - 1] + data[idx];
                 }
@@ -185,7 +142,6 @@ class SURF {
 
         for (let i = 0; i < hDst; i++) {
             for (let j = 0; j < wDst; j++) {
-                // x & y in src coordinates
                 const x = (j * wSrc) / wDst;
                 const xMin = Math.floor(x);
                 const xMax = Math.min(Math.ceil(x), wSrc - 1);
@@ -328,8 +284,12 @@ class SURF {
         // const x = matrix.solve(A, b, (useSVD = true));
         // console.log('b ', b);
         // console.log('A ', A);
-        const invObject = matrix.solve(A, b);
+        // const A_ = new Matrix(A);
+        // const invA = A.pseudoInverse();
+        // const x = invA.mmul(b);
+        const invObject = solve(A, b);
         const x = invObject.data;
+        console.log('x ', x);
         const isOK = (x[0] !== 0 || x[1] !== 0 || x[2] !== 0) &&
             Math.abs(x[0]) <= 1 && Math.abs(x[1]) <= 1 && Math.abs(x[2]) <= 1;
 
@@ -466,8 +426,10 @@ class SURF {
 
                          // const kpt = this.genKeyPoint(hCenter, wCenter, sizes[layer], -1, val, octave, (traces[layer][j] > 0) - (traces[layer][j] < 0));
                          const kpt = {
-                             x: wCenter,
-                             y: hCenter, 
+                             pt: {
+                                 x: wCenter,
+                                 y: hCenter
+                             }
                              size: sizes[layer],
                              angle: -1,
                              response: val,
@@ -489,6 +451,12 @@ class SURF {
         }
     }
 
+    clear(arr) {
+        if (arr.length) {
+            arr.splice(0, arr.length);
+        }
+    }
+
     // fastHessianDetector(sum, mask_sum, keypoints, octaves, octaveLayers, hessianThreshold) {
     fastHessianDetector() {
         const sampleStep0 = 1;
@@ -506,7 +474,8 @@ class SURF {
         this.middleIndices = this.genZeros(middleLayers);
 
         // clear()
-        this.keypoints.splice(0, this.keypoints.length);
+        // this.keypoints.splice(0, this.keypoints.length);
+        this.clear(this.keypoints);
         let index = 0;
         let middleIndex = 0;
         let step = sampleStep0;
@@ -592,7 +561,6 @@ class SURF {
             }
         }
 
-
         for (let k = 0; k < kps; k++) {
             let descriptorDir = 360.0 - 90.0;
             let squareMag = 0;
@@ -602,11 +570,7 @@ class SURF {
             const size = this.keypoints[k].size;
             const s = size * 1.2 / 9.0;
             const gradWaveSize = 2 * Math.round(2 * s);
-            // const center = kp.pt;
-            const center = {
-                x: this.keypoints[k].x,
-                y: this.keypoints[k].y
-            };
+            const center = this.keypoints[k].pt;
 
             if (height < gradWaveSize || width < gradWaveSize) {
                 this.keypoints[k].size = -1;
@@ -836,7 +800,7 @@ class SURF {
             console.log('mask', !this.mask);
             if (!this.mask) {
                 for (let i = 0; i < this.keypoints.length;) {
-                    const { x, y } = this.keypoints[i];
+                    const { x, y } = this.keypoints[i].pt;
                     if (this.mask[y][x] === 0) {
                         // TODO
                         // erase
@@ -899,6 +863,18 @@ class SURF {
         }
     }
 
+    // computeImageFeatures(finder, img, feature) {
+    getFeatures(imgIdx) {
+        this.feature = {
+            imgIdx: imgIdx, 
+            height: this.height, 
+            width: this.width, 
+            keypoints: this.keypoints,
+            descriptors: this.descriptors
+        }
+    }
+
+
     async draw() {
         let img = await Jimp.read(this.filePath);
         const width = img.bitmap.width;
@@ -913,11 +889,11 @@ class SURF {
             img.bitmap.data[idx + 2] = 0;
             img.bitmap.data[idx + 3] = 255;
         }
-        img.write(`./test_${saveCount}.png`, () => {
+        img.write(`./test_${imgCount}.png`, () => {
             console.log('draw OK ');
         });
-        saveCount += 1;
-        console.log('count ', saveCount);
+        imgCount += 1;
+        console.log('count ', imgCount);
     }
 
     // create(hessianThreshold, octaves, layers, extended, upright) {
@@ -935,6 +911,7 @@ class SURF {
         console.log('options', this.hessianThreshold);
 
         await this.detectAndCompute();
+        this.getFeatures(imgCount);
         await this.draw();
     }
 };
@@ -942,6 +919,20 @@ class SURF {
 
 class stitch {
     constructor() {
+        this.features = [];
+        this.hDst = [];
+        this.hMask = [];
+        this.cameras = [];
+        this.numImages = 0;
+        this.seamWorkAspect = 0;
+        this.images = [];
+        this.imagesWarped = [];
+        this.nearPairs = [];
+        this.pairMatches = [];
+        this.matchesConf = 0;
+        // TODO
+        this.matchInfo = [];
+
         matchesInfo;
         FeaturesMatcher;
         AffineBestOf2NearestMatcher;
@@ -950,8 +941,6 @@ class stitch {
 
     }
 
-    computeImageFeatures(finder, img, feature) {
-    }
 
     collectGarbage() {
     }
@@ -959,7 +948,61 @@ class stitch {
     matchesGraphAsString(imgNames, pairwiseMatches, confThresh) {
     }
 
-    leaveBiggestComponent(features, pairwiseMatches, confThresh) {
+    leaveBiggestComponent(pairwiseMatches, confThresh) {
+        const numImages = this.features.length;
+        //TODO
+        DisjointSets comps(numImages);
+        for (let i = 0; i < numImages; i++) {
+            for (let j = 0; j < numImages; j++) {
+                if (pairwiseMatches[i * numImages + j].confidence < confThreshold) {
+                    continue;
+                }
+                const comp1 = comps.findSetByElem(i);
+                const comp2 = comps.findSetByElem(j);
+                if (comp1 != comp2) {
+                    comps.mergeSets(comp1, comp2);
+                }
+            }
+        }
+        // TODO getMax
+        const maxComp = getMax(comps);
+
+        let indices = [];
+        let indicesRemoved = [];
+        for (let i = 0; i < numImages; i++) {
+            if (comps.findSetByelem(i) == maxComp) {
+                indices.push(i);
+            } else {
+                indicesRemoved.push(i);
+            }
+        }
+        let subFeatures = [];
+        let subPairwiseMatches = [];
+        for (let i = 0; i < indices.length; i++) {
+            subFeatures.push(this.features[indices[i]]);
+            for (let j = 0; j < indices.length; j++) {
+                subPairwiseMatches.push(pairMatches[indices[i] * numImages + indices[j]]);
+                let newLength = subPairwiseMatches.length;
+                subPairwiseMatches[newLength - 1].srcIdx = i;
+                subPairwiseMatches[newLength - 1].dstIdx = j;
+            }
+        }
+
+        if (subFeatures.length === numImages) {
+            return indices;
+        }
+
+        for (let i = 0; i < indicesRemoved.length(); i++) {
+            console.log('remove ', indicesRemoved[i]);
+        }
+
+        this.features = subFeatures;
+        pairwiseMatches = subPairwiseMatches;
+        
+        return indices;
+    }
+
+    findMaxSpanningTree() {
     }
 
     createDefault(exposCompType) {
@@ -980,7 +1023,24 @@ class stitch {
     setSharpness() {
     }
 
-    feed() {
+    feed(img, mask, dstROI, pt) {
+        const height = img.length;
+        const width = img[0].length;
+        const dx = pt.x - dstROI.x;
+        const dy = pt.y - dstROI.y;
+        for (let y = 0; y < height; y++) {
+            const hSrc = img[y]; 
+            const hDst = dst[y + dy];
+            const hMask = mask[y + dy];
+            for (let x = 0; x < height; x++) {
+                if (hMask[x]) {
+                    hDst[x + dx] = hSrc[x];
+                }
+                hMask[d + dx] |= hMask[x];
+            }
+        }
+        this.hDst = hDst;
+        this.hMask = hMask;
     }
 
     dilate(masksWarped, dilatedMask, mat) {
@@ -998,6 +1058,119 @@ class stitch {
     process() {
     }
 
+    warp() {
+    }
+
+    rotationWarp() {
+        for (let i = 0; i < this.numImages; i++) {
+            let ck = this.cameras[i];
+            const swa = this.seamWorkAspect;
+            ck[0][0] *= swa;
+            ck[0][2] *= swa;
+            ck[1][1] *= swa;
+            ck[1][2] *= swa;
+            
+            const srcSize = {
+                height: this.images[i].length,
+                width: this.images[i][0].length
+            };
+            this.corners[i] = this.warp(srcSize, ck, this.cameras[i].R, imagesWarped[i]);
+
+        }
+    }
+
+    compensate() {
+    }
+
+
+    swap(a, b) {
+        let c = a;
+        a = b;
+        b = c;
+    }
+
+    matchPair() {
+        // TODO random
+        //
+        const numImages = this.numImages;
+        for (let i = 0; i < numImages; i++) {
+            const from = this.nearPairs[i].from;
+            const to = this.nearPairs[i].to;
+            const pairIdx = from * numImages + to;
+            this.pairMatches[pairIdx].srcIdx = from;
+            this.pairMatches[pairIdx].dstIdx = to;
+            const dualPairIdx = to * numImages + from; 
+            // TODO FIXME
+            this.pairMatches[dualPairIdx] = this.pairMatches[pairIdx];
+
+            this.pairMatches[dualPairIdx].srcIdx = to;
+            this.pairMatches[dualPairIdx].dstIdx = from;
+            if (this.pairMatches[pairIdx].H) {
+                // TODO inv
+                this.pairMatches[dualPairIdx].H = this.pairMatches[pairIdx].H.inv();
+            }
+
+            // TODO matches
+            for (let j = 0; j < this.pairMatches[dualPairIdx].matches.length; j++) {
+                this.swap(this.pairMatches[dualPairIdx].matches[j].queryIdx,
+                    this.pairMatches[dualPairIdx].matches[j].trainIdx);
+            }
+        }
+    }
+
+    match(features1, features2, matchesInfo) {
+        // TODO CV_INSTRUMENT_REGION();
+        // TODO clear
+        // this.clear(this.matchesInfo.matches);
+        this.matchesInfo.matches.clear();
+        // TODO cv:DescriptorMatcher matcher
+        // TODO FLANN
+        let idxParams = this.KDTreeIdxParams;
+        let searchParams = this.searchParams;
+        
+        let matches = new MatchesSet();
+        let pairMatches = new DMatch();
+        matcher.knnMatch(features1.descriptors, features2.descriptors, pairMatches, 2);
+        for (let i = 0; i < pairMatches.length; i++) {
+            if (pairMatches[i].length < 2) {
+                continue;
+            }
+            const m0 = pairMatches[i][0];
+            const m1 = pairMatches[i][1];
+            if (m0.distance < (1.0 - this.matchConf) * m1.distance) {
+                matchesInfo.matches.push(m0);
+                // TODO insert makePair
+                // matches.insert(makePair(m0.queryIdx, m0.trainIdx));
+                matches.push([m0.queryIdx, m0.trainIdx]);
+            }
+        }
+
+        pairMatches.clear();
+        // feature2 -> 1
+        matcher.knnMatch(features2.descriptors, features1.descriptors, pairMatches, 2);
+        for (let i = 0; i < pairMatches.length; i++) {
+            if (pairMatches[i].length < 2) {
+                continue;
+            }
+            const m0 = pairMatches[i][0];
+            const m1 = pairMatches[i][1];
+            if (m0.distance < (1.0 - this.matchConf) * m1.distance) {
+                // TODO
+                if ([m0.queryIdx, m0.trainIdx] not in matches) {
+                    matchInfo.matches.push(new DMatch(m0.trainIx, m0.queryIdx, m0.distance));
+                }
+            }
+        }
+    }
+
+
+
+
+        
+
+    findSeam() {
+    }
+
     blend() {
     }
 
@@ -1005,6 +1178,863 @@ class stitch {
 
 
 };
+
+
+
+class MatchesSet {
+    constructor() {
+    }
+
+    knnMatch() {
+    }
+}
+
+
+class DMatch {
+    constructor() {
+    }
+}
+
+
+class RNG {
+}
+
+class FlannBasedMatcher {
+}
+
+
+class MatchesInfo {
+    constructor() {
+        this.srcIdx = 0;
+        this.dstIdx = 0;
+        this.matches = [];
+        this.inliersMask = [];
+        this.numInliers = [];
+        this.H = [];
+        this.confidence = [];
+    }
+}
+
+class KeyPoint {
+    constructor() {
+        this.keypointExample = {
+            pt: {
+                x: 0,
+                y: 0 
+            }
+            size: 0,
+            angle: 0,
+            response: 0,
+            octave: 0,
+            classID: 0 
+        };
+    }
+}
+
+class Pair {
+}
+
+class MatchPairsBody {
+}
+
+class Feature2D {
+}
+
+class ImageFeatures {
+}
+
+class FeaturesMatcher {
+    genMatrix(height, width, val) {
+        if (height === undefined || height < 1 || width < 1) {
+            return [];
+        } else if (width === undefined) {
+            let arr1D = [];
+            for (let i = 0; i < height; i++) {
+                arr1D.push(val);
+            }
+            return arr1D;
+        } else {
+            let arr1D = [];
+            let arr2D = [];
+            for (let i = 0; i < width; i++) {
+                arr1D.push(val);
+            }
+            for (let i = 0; i < height; i++) {
+                arr2D.push(arr1D.slice());
+            }
+            return arr2D;
+        }
+    }
+
+    makePair(a, b) {
+    }
+
+    operator (features, pairMatches, mask) {
+        const numImages = features.length;
+        const mask_ = this.genMatrix(numImages, numImages, val);
+        const nearPairs = new Pair();
+        for (let i = 0; i < numImages; i++) {
+            for (let j = i - 1; j < numImages; j++) {
+                if (features[i].keypoints.length > 0 && features[j].keypoints.length > 0 && mask_[i][j]) {
+                    nearPairs.push(this.makePair(i, j));
+                }
+            }
+        }
+
+        pairMatches.clear();
+        pairMatches.resize(numImages * numImages);
+        let body = new MatchPairsBody(this, features, pairMatches, nearPairs);
+        // TODO
+        body(0, nearPairs.length);
+    }
+}
+
+class BestOf2NearestMatcher {
+    constructor() {
+        this.matchConf = 0;
+        this.numMatchesThresh1 = 0;
+        this.numMatchesThresh2 = 0;
+    }
+
+    genMatrix(height, width, val) {
+        if (height === undefined || height < 1 || width < 1) {
+            return [];
+        } else if (width === undefined) {
+            let arr1D = [];
+            for (let i = 0; i < height; i++) {
+                arr1D.push(val);
+            }
+            return arr1D;
+        } else {
+            let arr1D = [];
+            let arr2D = [];
+            for (let i = 0; i < width; i++) {
+                arr1D.push(val);
+            }
+            for (let i = 0; i < height; i++) {
+                arr2D.push(arr1D.slice());
+            }
+            return arr2D;
+        }
+    }
+
+    findHomography() {
+    }
+    determinant() {
+    }
+
+    match(features1, features2, matchesInfo) {
+        if (matchesInfo.matches.length < this.numMatchesThresh1) {
+            return;
+        }
+
+        let srcPoints = this.genMatrix(matchesInfo.matches.length, 2, 0);
+        let dstPoints = this.genMatrix(matchesInfo.matches.length, 2, 0);
+        for (let i = 0; i < matchesInfo.matches.length; i++) {
+            const m = matchesInfo.matches[i];
+            let px = features1.keypoints[m.queryIdx].x;
+            let py = features1.keypoints[m.queryIdx].y;
+            px -= features1.width * 0.5;
+            py -= features1.height * 0.5;
+            srcPoints[i][0] = px;
+            srcPoints[i][1] = py;
+
+            px = features2.keypoints[m.queryIdx].x;
+            py = features2.keypoints[m.queryIdx].y;
+            px -= features2.width * 0.5;
+            py -= features2.height * 0.5;
+            dstPoints[i][0] = px;
+            dstPoints[i][1] = py;
+        }
+        matchesInfo.H = this.findHomography(srcPoints, dstPoints, matchesInfo.inliersMask, 'RANSAC');
+        if (!matchesInfo.H || Math.abs(this.determinant(matchesInfo.H)) < 1e-6) {
+            return;
+        }
+        matchesInfo.numInliers = 0;
+        for (let i = 0; i < matchesInfo.inliersMask.length; i++) {
+            if (matchesInfo,inliersMask[i]) {
+                matchesInfo.numInliers += 1;
+            }
+        }
+        matchesInfo.confidece = matchesInfo.numInliers / (8 + 0.3 * matchesInfo.matches.length);
+        matchesInfo.confidece = matchesInfo.confidence > 3 ? 0.0 : matchesInfo.confidence;
+        if (matchesInfo.numInliers < numMatchesThresh2) {
+            return;
+        }
+
+        // for inliers
+        // TODO create
+        // srcPoints.create(1, matchesInfo.numInliers);
+        // dstPoints.create(1, matchesInfo.numInliers);
+        srcPoints = this.genMatrix(matchesInfo.numInliers, 2, 0);
+        dstPoints = this.genMatrix(matchesInfo.numInliers, 2, 0);
+        let inlierIdx = 0;
+        for (let i = 0; i < matchesInfo.matches.length; i++) {
+            if (!matchesInfo.inliersMask[i]) {
+                continue;
+            }
+            const m = machesInfo.matches[i];
+            let px = features1.keypoints[m.queryIdx].x;
+            let py = features1.keypoints[m.queryIdx].y;
+            px -= features1.width * 0.5;
+            py -= features1.height * 0.5;
+            srcPoints[i][0] = px;
+            srcPoints[i][1] = py;
+
+            px = features2.keypoints[m.queryIdx].x;
+            py = features2.keypoints[m.queryIdx].y;
+            px -= features2.width * 0.5;
+            py -= features2.height * 0.5;
+            dstPoints[i][0] = px;
+            dstPoints[i][1] = py;
+            inlierIdx += 1;
+        }
+        matchesInfo.H = this.findHomography(srcPoints, destPoints, 'RANSAC');
+    }
+
+    operator(features, pairMatches, mask, rangeWidth) {
+        const numImages = features.length;
+        let mask_ = this.genMatrix(numImages, numImages, 1);
+        let nearPairs = new Pair();
+        for (let i = 0; i < numImages - 1; i++) {
+            for (let j = i + 1; j < Math.min(numImages, i + rangeWidth); j++) {
+                if (features[i].keypoints.length > 0 && features[j].keypoints.length > 0 && mask_[i][j]) {
+                    nearPairs.push(this.makePair(i, j));
+                }
+            }
+        }
+        pairMatches.resize(numImages * numImages);
+        let body = new MatchPairsBody(this, features, pairMatches, nearPairs);
+        // TODO
+        body(0, nearPairs.length);
+    }
+
+    collectGarbage() {
+    }
+}
+
+
+class Stitcher {
+    constructor() {
+        this.regRes = 0.6;
+        this.seamEstRes = 0.1;
+        this.composeRes = -1.0;
+        this.confidenceThresh = 1;
+        this.doWaveCorrect = false;
+        this.workScale = 1;
+        this.seamScale = 1;
+        this.seamWorkAspect = 1;
+        this.warpedImgScale = 1;
+        this.imgs = [];
+        this.masks = [];
+        // { heidht, width }
+        this.fullImgSizes = [];
+        this.features = [];
+        this.pairMatches = [];
+        this.seamEstImgs = [];
+        this.indices = [];
+        this.cameras = [];
+        this.resultMask = [];
+        this.estimator = new what(); 
+        this.bundleAdjuster = new what(); 
+    }
+
+    genMatrix(height, width, val) {
+        if (height === undefined || height < 1 || width < 1) {
+            return [];
+        } else if (width === undefined) {
+            let arr1D = [];
+            for (let i = 0; i < height; i++) {
+                arr1D.push(val);
+            }
+            return arr1D;
+        } else {
+            let arr1D = [];
+            let arr2D = [];
+            for (let i = 0; i < width; i++) {
+                arr1D.push(val);
+            }
+            for (let i = 0; i < height; i++) {
+                arr2D.push(arr1D.slice());
+            }
+            return arr2D;
+        }
+    }
+
+    resize(mat) {
+    }
+
+    clear(arr) {
+        arr.splice(0, arr.length);
+    }
+
+    composePanorama(images, pano) {
+        const height = images[0].length;
+        const width = images[0][0].length;
+        // let img = this.genMatrix(height, width, 0);
+        let img = [];
+        this.resize(this.seamEstImgs);
+        for (let i = 0; i < images.length; i++) {
+            this.imgs[i] = images[i];
+            img = this.resize(this.imgs[i], this.seamScale, this.seamScale);
+            this.seamEstImgs[i] = img;
+        }
+        let subSeamEstImgs = [];
+        let subImgs = [];
+        for (let i = 0; i < this.indices.length; i++) {
+            subImgs.push(this.imgs[indices[i]]);
+            subSeamEstImgs.push(this.seamEstImgs[indices[i]]);
+        }
+        this.seamEstImgs = subSeamEstImgs;
+        this.imgs = subImgs;
+
+        let pano_ = [];
+        const numImages = this.imgs.length;
+        let corners = this.genMatrix(numImages);
+        let imagesWarped = this.genMatrix(numImages);
+        let masksWarped = this.genMatrix(numImages);
+        let sizes = this.genMatrix(numImages);
+        let masks = [];
+        for (let i = 0; i < numImages; i++) {
+            masks.push(this.genMatrix(this.seamEstImgs[i].length, this.seamEstImgs[i][0].length, 255)); 
+        }
+
+        let w = new Warper(this.warpedImgScale * this.seamWorkAspect);
+        for (let i = 0; i < numImages; i++) {
+            let K = this.cameras[i].K();
+            K[0][0] *= this.seamWorkAspect;
+            K[0][2] *= this.seamWorkAspect;
+            K[1][1] *= this.seamWorkAspect;
+            K[1][2] *= this.seamWorkAspect;
+
+            const seamEstImgSize = {
+                height: this.seamEstImgs[i].length,
+                width: this.seamEstImgs[i][0].length
+            };
+            corners[i] = w.warp(seamEstImgSize, K, this.cameras[i].R, interpFlags, BORDER_REFLECT, imagesWarped[i]);
+            sizes[i] = imagesWarped[i].size;
+            const maskSize = {
+                height: this.masks[i].length,
+                width: this.masks[i][0].length
+            };
+            w.warp(maskSize, K, this.cameras[i].R, INTER_NEAREST, BORDER_CONSTANT, masksWarped[i]);
+        }
+
+        this.exposureComp.feed(conners, imagesWarped, masksWarped);
+        for (let i = 0; i < numImages; i++) {
+            this.exposureComp.apply(i, corners[i], imagesWarped[i], masksWarped[i]);
+        }
+        seamFinder.find(imagesWarped, corners, masksWarped);
+        
+        this.clear(this.seamEstImgs);
+        this.clear(imagesWarped);
+        this.clear(masks);
+        
+
+        let imgWarped = []; 
+        let composeWorkAspect = 1;
+        let isBlenderPrepared = false;
+        let composeScale = 1;
+        let isComposeScaleSet = false;
+        let  camerasScaled = [];
+
+        for (let idx = 0; idx < numImages; idx++) {
+            let fullImg = this.imgs[idx];
+            if (!isComposeScaleSet) {
+                if (this.composeRes > 0) {
+                    composeScale = Math.min(1.0, Math.sqrt(this.composeRes * 1e6 / fullImg.length * fullImg[0].length));
+                }
+                isComposeScaleSet = true;
+                composeWorkAspect = composeScale / this.workScale;
+                let warpScale = this.wapredImgScale * composeWorkAspect;
+                w = new warp(warpScale);
+
+                for (let i = 0; i < this.imgs.length; i++) {
+                    camerasScaled[i].ppx *= composeWorkAspect;
+                    camerasScaled[i].ppy *= composeWorkAspect;
+                    camerasScaled[i].focal *= composeWorkAspect;
+
+                    let sz = this.fullImgSizes[i];
+                    if (Math.abs(composeScale - 1) > 0.1) {
+                        sz.height = Math.round(this.fullImgSizes[i].height * composeScale);
+                        sz.width = Math.round(this.fullImgSizes[i].width * composeScale);
+                    }
+                    let K = camerasScaled[i].K();
+                    let roi = w.warpROI(sz, K, camerasScaled[i].R);
+                    corners[i] = roi.tl();
+                    sizes[i] = roi.size();
+                }
+            }
+            if (Math.abs(composeScaled - 1) > 0.1) {
+                this.resize(fullImg, img, composeScale, composeScale, INTER_LINEAR_EXACT);
+            } else {
+                img = fullImg;
+            }
+            this.clear(fullImg);
+            let K = camerasScaled[idx].K();
+            w.warp(img, K, this.cameras[idx].R, this.interpFlags, BORDER_REFLECT, imgWarped); 
+            mask = this.genMatrix(img.length, img[0].length, 255);
+            w.warp(mask, K, this.cameras[idx].R, INTER_NEAREST, BORDER_REFLECT, imgWarped); 
+            this.clear(imgWarped);
+            this.clear(mask);
+            this.dilate(masksWarped[idx], dilatedMask);
+            this.resize(dilatedMask, seamMask, maskWarped.length,  maskWarped[0].length); 
+            this.bitwiseAnd(seamMask, maskWarped, maskWarped);
+            if ( !isBlenderPrepared) {
+                this.blender.prepare(cornes, sizes);
+                isBlenderPrepared = true;
+            }
+            this.blender.feed(imgWarped, maskWarped, corners[idx]);
+            blender.blend(pano, this.resultMask);
+            return OK;
+        }
+    }
+
+    stitch(images, masks, pano) {
+        const status = this.estimateTransform(images, masks);
+        if (!status) {
+            return status;
+        }
+        return this.composePanorama(pano);
+    }
+
+    estimateTransform(images, masks) {
+        this.imgs = images;
+        this.masks = masks;
+        let status = 0;
+        if ((status = this.matchImages()) !== OK) {
+            return status;
+        }
+        if ((status = this.estimateCameraParams()) !== OK) {
+            return status;
+        }
+        return OK;
+    }
+
+    matchImages() {
+        if (this.imgs.length < 2) {
+            return ERR_NEED_MORE_IMGS;
+        }
+
+        const numImages = this.imgs.length;
+        const height = this.imgs[0].length;
+        const width = this.imgs[0][0].length;
+        this.workScale = 1;
+        this.seamWorkAspect = 1;
+        this.seamScale = 1
+        let isWorkScaleSet = false;
+        let isSeamScaleSet = false;
+        this.resize(this.features, numImages); 
+        this.resize(this.seamEstImgs, numImages); 
+        this.resize(this.fullImgSizes, numImages); 
+
+        let featureFindImgs = []; 
+        let featureFindMasks = []; 
+        for (let i = 0; i < numImages; i++) {
+            featureFindImgs.push(this.genMatrix(height, width));
+            featureFindMasks.push(this.genMatrix(height, width));
+
+            if (this.regRes < 0) {
+                featureFindImgs[i] = this.imgs[i];
+                this.workScale = 1;
+                isWorkScaleSet = true;
+            } else {
+                if (!isWorkScaleSet) {
+                    this.workScale = Math.min(1.0, Math.sqrt(this.regRes * 1e6 / (this.fullImgSizes[i].height * this.fullImgSizes[i].width)));
+                    isWorkScaleSet = true;
+                }
+                this.resize(this.imgs[i], featureFindImgs[i], this.workScale, this.workScale, INTER_LINEAR_EXACT);
+            }
+            if (!isSeamScaleSet) {
+                this.seamScale = Math.min(1.0, Math.sqrt(this.seamEstRes * 1e6 / (this.fullImgSizes[i].height * this.fullImgSizes[i].width)));
+                this.seamworkAspect = this.seamScale / this.workScale;
+                isWorkScaleSet = true;
+            }
+            
+            if (this.masks) {
+                this.resize(this.masks[i], featureFindMasks[i], this.workScale, this.workScale, INTER_LINEAR_EXACT);
+            }
+        }
+
+        this.computeImgageFeatures(this.featuresFinder, featureFindImgs, this.features, featureFindMasks);
+        this.clear(featureFindImgs);
+        this.clear(featureFindMasks);
+
+        this.featuresMatcher(this.features, this.pairMathces, this.matchingMask);
+        this.featuresMatcher.collectGarbage();
+
+        let detail = new Detail();
+        this.indices = detail.leaveBiggestComponet(this.features, this.pairMatches, this.confThress);
+        let subImgs = [];
+        let subSeamEstImgs = [];
+        let subFullImgSizes = [];
+        for (let i = 0; i < this.indices.length; i++) {
+            subImgs.push(this.imgs[this.indices[i]]);
+            subSeamEstImgs.push(this.seamEstImgs[this.indices[i]]);
+            subFullImgSizes.push(this.fullImgSizes[this.indices[i]]);
+        }
+        this.seamEstImgs = subSeamEstImgs;
+        this.imgs = subImgs;
+        this.fullImgSizes = subFullImgSizes;
+
+        if (this.imgs.length < 2) {
+            return ERR_NEED_MORE_IMGS;
+        }
+        return OK;
+    }
+
+    estimateCameraParams() {
+        if (!this.estimator(this.features, this.pairMatches, this.cameras)) {
+            return ERR_HOMOGRAPHY_EST_FAIL;
+        }
+        this.bundleAdjuster.setConfThresh(this.confThresh);
+        if (!this.bundleAdjuster(this.features, this.pairMatches, this.cameras)) {
+            return ERR_CAMERA_PARAMS_ADJUST_FAIL;
+        }
+        let focals = [];
+        for (let i = 0; i < this.cameras.length; i++) {
+            focals.push(this.cameras[i].focal);
+        }
+        focals.sort((a, b) => a - b);
+        if (focals.length % 2 === 1) {
+            this.warpedImageScale = focals[Math.floor(focals.length / 2)];
+        } else {
+            this.warpedImageScale = (focals[Math.floor(focals.length / 2 - 1)] + focals[Math.floor(focals.length / 2)]) * 0.5;
+        }
+
+        if (this.doWaveCorrect) {
+            let rMats = [];
+            for (let i = 0; i < this.cameras.length; i++) {
+                rMats.push(this.cameras[i].R);
+            }
+            let detail = new Detail();
+            detail.waveCorrect(rMats, this.waveCorrectKind);
+            for (let i = 0; i < this.cameras.length; i++) {
+                this.cameras[i].R = rMats[i];
+            }
+        }
+
+        return OK;
+    }
+}
+
+class CameraParams {
+    constructor() {
+        this.focal = 1;
+        this.aspect = 1;
+        this.ppx = 0;
+        this.ppy = 0;
+        this.R = this.genEye(3);
+        this.T = this.genMatrix(3, 1, 0);
+        this.projector = new PlaneProjector();
+    }
+
+    genMatrix(height, width, val) {
+        if (height === undefined || height < 1 || width < 1) {
+            return [];
+        } else if (width === undefined) {
+            let arr1D = [];
+            for (let i = 0; i < height; i++) {
+                arr1D.push(val);
+            }
+            return arr1D;
+        } else {
+            let arr1D = [];
+            let arr2D = [];
+            for (let i = 0; i < width; i++) {
+                arr1D.push(val);
+            }
+            for (let i = 0; i < height; i++) {
+                arr2D.push(arr1D.slice());
+            }
+            return arr2D;
+        }
+    }
+
+    genEye(n) {
+        if (n === undefined || N < 1) {
+            return [];
+        } else {
+            let mat = this.genMatrix(n, n, 0);
+            for (let i = 0; i < n; i++) {
+                mat[i][i] = 1;
+            }
+            return mat;
+        }
+    }
+
+    K() {
+        let K = this.genEye(3);
+        k[0][0] = this.focal;
+        k[0][2] = this.ppx;
+        k[1][1] = this.focal * this.aspect;
+        k[1][2] = this.ppy;
+        return K;
+    }
+    update(options) {
+        this.focal = options.focal || this.focal;
+        this.aspect = options.aspect || this.aspect;
+        this.ppx = options.ppx || this.ppx;
+        this.ppy = options.ppy || this.ppy;
+        this.R = options.R || this.R;
+        this.T = options.T || this.T;
+    }
+}
+
+class PlaneWarper {
+    constructor() {
+        this.projector = new PlaneProjector();
+    }
+
+    warpPoint(pt, K, R, T) {
+        this.projector.setCameraParams(K, R, T);
+        let uv = {
+            x: 0,
+            y: 0
+        };
+        this.projector.mapForward(pt,x pt.y, uv.x, uv.y);
+    }
+
+    buildMaps(srcSize, K, R, T, xmap, ymap) {
+        this.projector.setCameraParams(K, R, T);
+        // TL: Top Left
+        let dstTL = {
+            x: 0,
+            y: 0
+        };
+        let dstBR = {
+            x: 0,
+            y: 0
+        };
+        this.detectResultROI(srcSize, dstTL, dstBR);
+        // let dstSize = [dstBR.x - dstTL.x + 1, dstBR.y - dstTL.y + 1];
+        let dstSize = {
+            x: dstBR.x - dstTL.x + 1,
+            y: dstBR.y - dstTL.y + 1
+        }
+
+        xmap = this.genMatrix(dstSize.y, dstSize.x, 0);
+        ymap = this.genMatrix(dstSize.y, dstSize.x, 0);
+        let x = 0;
+        let y = 0;
+        for (let v = dstTL.y; v <= dstBR.y; v++) {
+            for (let u = dstTL.x; u <= dstBR.x; u++) {
+                this.projector.mapBackward(u, v, x, y);
+                xmap[v - dstTL.y][u - dstTL.x] = x;
+                ymap[v - dstTL.y][u - dstTL.x] = y;
+            }
+        }
+        const rect = {
+            tl: {
+                x: dstTL.x,
+                y: dstTL.y
+            },
+            height: dstBR.y - dstTL.y,
+            width: dstBR.x - dstTL.x
+        };
+        return rect; 
+    }
+
+
+    warp(src, K, R, T, interpMode, borderMode, dst) {
+        let uxmap = [];
+        let uymap = [];
+        let dstROI = this.buildMaps(src.size, K, R, T, uxmap, uymap);
+        dst = this.genMatrix(dstROI.height, dstROI.width, 0);
+        this.remap(src, dst, uxmap, uymap, interpMode, borderMode);
+        return dstROI.tl;
+    }
+
+    warpROI(srcSize, K, R, T) {
+        this.projector.setCameraParams(K, R, T);
+        let dstTL = {
+            x: 0,
+            y: 0
+        };
+        let dstBR = {
+            x: 0,
+            y: 0
+        };
+        this.detectResultROI(srcSize, dstTL, dstBR);
+        const rect = {
+            tl: {
+                x: dstTL.x,
+                y: dstTL.y
+            },
+            height: dstBR.y + 1 - dstTL.y,
+            width: dstBR.x + 1 - dstTL.x
+        };
+        return rect; 
+    }
+
+    detectResultROI(srcSize, dstTL, dstBR) {
+        let TLU = Number.MAX_VALUE;
+        let TLV = Number.MAX_VALUE;
+        let BRU = -Number.MAX_VALUE;
+        let BRV = -Number.MAX_VALUE;
+        let u = 0;
+        let v = 0;
+        this.projector.mapForward(0, 0, u, v);
+        TLU = Math.min(TLU, u);
+        TLV = Math.min(TLV, v);
+        BRU = Math.max(BRU, u);
+        BRV = Math.max(BRV, v);
+        this.projector.mapForward(0, srcSize.height - 1, u, v);
+        TLU = Math.min(TLU, u);
+        TLV = Math.min(TLV, v);
+        BRU = Math.max(BRU, u);
+        BRV = Math.max(BRV, v);
+        this.projector.mapForward(srcSize.width - 1, srcSize.height - 1, u, v);
+        TLU = Math.min(TLU, u);
+        TLV = Math.min(TLV, v);
+        BRU = Math.max(BRU, u);
+        BRV = Math.max(BRV, v);
+
+        dstTL.x = TLU;
+        dstTL.y = TLV;
+        dstBR.x = BRU;
+        dstBR.y = BRV;
+    }
+}
+
+class PlaneProjector() {
+    constructor() {
+        this.rinv = [];
+        this.rkinv = [];
+        this.krinv = [];
+        this.k = this.genArray(9, 0);
+        this.t = this.genArray(3, 0);
+        this.scale = 1.0;
+
+    }
+
+    isNumber(obj) {
+        return obj === +obj;
+    }
+
+    genArray(height, val) {
+        if (height === undefined || height < 1 || !isNumber(val)) {
+            return [];
+        } else {
+            let arr1D = [];
+            for (let i = 0; i < height; i++) {
+                arr1D.push(val);
+            }
+            return arr1D;
+        }
+    }
+
+    genMatrix(height, width, val) {
+        if (height === undefined || height < 1 || width < 1 || !isNumber(val)) {
+            return [];
+        } else if (width === undefined) {
+            let arr1D = [];
+            for (let i = 0; i < height; i++) {
+                arr1D.push(val);
+            }
+            return arr1D;
+        } else {
+            let arr1D = [];
+            let arr2D = [];
+            for (let i = 0; i < width; i++) {
+                arr1D.push(val);
+            }
+            for (let i = 0; i < height; i++) {
+                arr2D.push(arr1D.slice());
+            }
+            return arr2D;
+        }
+    }
+
+    mapForward(x, y, u, v) {
+        rkinv = this.rkinv;
+        scale = this.scale;
+        t = this.t;
+        let x_ = rkinv[0] * x + rkinv[1] * y + rkinv[2]; 
+        let y_ = rkinv[3] * x + rkinv[4] * y + rkinv[5]; 
+        let x_ = rkinv[6] * x + rkinv[7] * y + rkinv[8]; 
+        x_ = t[0] + x_ / z_ * (1 - t[2]);
+        y_ = t[1] + y_ / z_ * (1 - t[2]);
+
+        u = scale * x_;
+        v = scale * y_;
+
+
+    }
+
+    mapBackward(u, v, x, y) {
+        krinv = this.krinv;
+        scale = this.scale;
+        t = this.t;
+        u = u / scale - t[0];
+        v = v / scale - t[1];
+        let  z = 0;
+        x = krinv[0] * u + krinv[1] * v + krinv[2] * (1 - t[2]); 
+        y = krinv[3] * u + krinv[4] * v + krinv[5] * (1 - t[2]); 
+        z = krinv[6] * u + krinv[7] * v + krinv[8] * (1 - t[2]); 
+
+        x /= z;
+        y /= z;
+    }
+
+    setCameraParams(K, R, T) {
+        this.k = [K[0][0], K[0][1], K[0][2],
+            K[1][0], K[1][1], K[1][2],
+            K[2][0], K[2][1], K[2][2]];
+
+        // let Rinv = matrix.transpose(R); 
+        const R_ = new Matrix(R);
+        const K_ = new Matrix(K);
+        const Rinv = R_.transpose(); 
+        const Kinv = inverse(K_);
+        const RKinv = R_.mmul(Kinv); 
+        const KRinv = K_.mmul(Rinv);
+
+        this.rinv = [Rinv[0][0], Rinv[0][1], Rinv[0][2],
+            Rinv[1][0], Rinv[1][1], Rinv[1][2],
+            Rinv[2][0], Rinv[2][1], Rinv[2][2]];
+
+        this.krinv = [KRinv[0][0], KRinv[0][1], KRinv[0][2],
+            KRinv[1][0], KRinv[1][1], KRinv[1][2],
+            KRinv[2][0], KRinv[2][1], KRinv[2][2]];
+        
+        this.t = [T[0][0], T[0][1], T[0][2]];
+    }
+}
+
+
+class Detail {
+    constructor() {
+    }
+
+    
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
