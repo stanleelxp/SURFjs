@@ -917,6 +917,7 @@ class SURF {
 };
 
 
+// just Ref
 class stitch {
     constructor() {
         this.features = [];

@@ -1,3 +1,4 @@
+/* 
 // import SURF from './surf';
 const SURF = require('./surf');
 
@@ -16,3 +17,4 @@ console.log('SURF', SURF);
 const surf = new SURF();
 const result = surf.create(filePath, options);
 console.log('Result ', result);
+*/
